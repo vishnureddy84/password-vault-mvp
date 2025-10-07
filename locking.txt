@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<!-- Chosen Palette: Indigo & Cool Gray -->
+<!-- Application Structure Plan: The application is designed as a single-page, tab-based interface after an initial security unlock. The two primary views are 'Password Generator' and 'Secure Vault'. This structure cleanly separates the two main user tasks. The user flow begins with a mandatory master password prompt to derive a client-side encryption key, enforcing a privacy-first model. Once unlocked, the user can toggle between the generator and their vault. The vault view uses a two-column layout on larger screens, showing a searchable list on the left and a form for adding/editing on the right, providing a seamless, non-disruptive user experience. This design was chosen for its efficiency and intuitive navigation, allowing users to manage and create credentials without losing context. -->
+<!-- Visualization & Content Choices: 
+- Report Info: Password Generator settings (length, character types). Goal: Interact/Inform. Presentation: HTML slider and checkboxes. Interaction: Real-time password generation on input change. Justification: Standard, intuitive UI for these controls. Library: Vanilla JS.
+- Report Info: List of saved vault items. Goal: Organize/Find. Presentation: Scrollable list using structured HTML/Tailwind. Interaction: Client-side filtering via a search bar; clicking an item opens it for editing. Justification: Provides fast, efficient access to stored data. Library: Vanilla JS.
+- Report Info: Individual vault item details (title, username, password, etc.). Goal: Inform/Edit. Presentation: HTML form. Interaction: Standard input fields with buttons for 'Copy Password', 'Toggle Visibility', and 'Use Generated Password'. Justification: A clear and conventional method for managing sensitive credential data. Library: Vanilla JS.
+- Cryptography: Client-side encryption of vault secrets. Goal: Secure. Presentation: Not visible to the user. Interaction: Handled automatically on save/load. Justification: Core security requirement. Library: Web Crypto API (browser native).
+-->
+<!-- CONFIRMATION: NO SVG graphics used. NO Mermaid JS used. -->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Privacy-First Vault</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .vault-list-container::-webkit-scrollbar { width: 8px; }
+        .vault-list-container::-webkit-scrollbar-thumb { background-color: #6366f1; border-radius: 4px; }
+        .vault-list-container::-webkit-scrollbar-track { background-color: #eef2ff; }
+        .btn-primary { @apply transition-all duration-200 ease-in-out; }
+        .btn-primary:hover { @apply transform -translate-y-0.5 shadow-lg; }
+        .btn-primary:active { @apply transform translate-y-0 shadow-md; }
+        .tab-active { border-bottom: 3px solid #6366f1; font-weight: 600; color: #1f2937; }
+        .input-text { @apply block w-full px-3 py-2 bg-white border border-gray-300 rounded-md shadow-sm placeholder-gray-400 focus:outline-none focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm; }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen flex flex-col items-center justify-center p-4">
+
+    <div id="app" class="w-full max-w-5xl bg-white shadow-2xl rounded-2xl overflow-hidden min-h-[80vh]">
+        <header class="bg-gray-800 text-white p-4 flex justify-between items-center">
+            <div class="flex items-center space-x-2">
+                <i data-lucide="shield-check" class="text-indigo-400"></i>
+                <h1 class="text-xl font-bold tracking-tight">Privacy-First Vault</h1>
+            </div>
+            <div id="auth-status" class="flex items-center text-sm font-medium text-gray-300"></div>
+        </header>
+
+        <main id="main-content" class="p-2 sm:p-4 md:p-6"></main>
+    </div>
+
+    <div id="custom-modal" class="fixed inset-0 bg-black bg-opacity-60 z-50 hidden items-center justify-center p-4">
+        <div class="bg-white p-6 rounded-xl shadow-2xl max-w-sm w-full">
+            <h3 id="modal-title" class="text-xl font-semibold mb-3 text-gray-800"></h3>
+            <p id="modal-message" class="text-gray-600 mb-6"></p>
+            <div id="modal-actions" class="flex justify-end space-x-3"></div>
+        </div>
+    </div>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, deleteDoc, onSnapshot, collection, query, runTransaction } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-vault-app';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        if (firebaseConfig) {
+            setLogLevel('Debug');
+            window.app = initializeApp(firebaseConfig);
+            window.db = getFirestore(window.app);
+            window.auth = getAuth(window.app);
+        } else {
+            document.getElementById('main-content').innerHTML = `<div class="p-8 text-center text-red-600">Firebase configuration is missing. The application cannot run.</div>`;
+        }
+
+        window.state = {
+            userId: null,
+            masterKey: null,
+            vaultItems: [],
+            currentTab: 'vault',
+            editItem: null,
+            searchTerm: '',
+            clipboardClearTimeout: null,
+            messageTimeout: null,
+            generatedPassword: ''
+        };
+
+        const SALT_LENGTH = 16;
+        const IV_LENGTH = 12;
+
+        window.showModal = (title, message, isConfirm = false, onConfirm = () => {}) => {
+            const modal = document.getElementById('custom-modal');
+            document.getElementById('modal-title').textContent = title;
+            document.getElementById('modal-message').textContent = message;
+            const actions = document.getElementById('modal-actions');
+            actions.innerHTML = '';
+
+            const closeBtn = document.createElement('button');
+            closeBtn.className = 'px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 transition';
+            closeBtn.textContent = isConfirm ? 'Cancel' : 'Close';
+            closeBtn.onclick = () => modal.classList.add('hidden');
+            actions.appendChild(closeBtn);
+
+            if (isConfirm) {
+                const confirmBtn = document.createElement('button');
+                confirmBtn.className = 'px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition';
+                confirmBtn.textContent = 'Confirm';
+                confirmBtn.onclick = () => { modal.classList.add('hidden'); onConfirm(); };
+                actions.appendChild(confirmBtn);
+            }
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+        };
+
+        window.showMessage = (message, isError = false) => {
+            const container = document.getElementById('message-container');
+            if (!container) return;
+            container.innerHTML = `<div class="p-3 rounded-lg text-sm text-center ${isError ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}">${message}</div>`;
+            clearTimeout(window.state.messageTimeout);
+            window.state.messageTimeout = setTimeout(() => container.innerHTML = '', 5000);
+        };
+
+        window.deriveKey = async (password, salt) => {
+            const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), { name: 'PBKDF2' }, false, ['deriveKey']);
+            return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, keyMaterial, { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+        };
+
+        window.encrypt = async (plaintext, key) => {
+            const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+            const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(plaintext));
+            return {
+                ciphertext: btoa(String.fromCharCode(...new Uint8Array(ciphertext))),
+                iv: btoa(String.fromCharCode(...iv)),
+            };
+        };
+
+        window.decrypt = async (ciphertextBase64, ivBase64, key) => {
+            try {
+                const ciphertext = Uint8Array.from(atob(ciphertextBase64), c => c.charCodeAt(0));
+                const iv = Uint8Array.from(atob(ivBase64), c => c.charCodeAt(0));
+                const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+                return new TextDecoder().decode(decrypted);
+            } catch (e) {
+                throw new Error("Decryption failed. Incorrect master password or corrupted data.");
+            }
+        };
+
+        const CHARS = {
+            LOWER: 'abcdefghijkmnpqrstuvwxyz',
+            UPPER: 'ABCDEFGHJKLMNPQRSTUVWXYZ',
+            NUMBERS: '23456789',
+            SYMBOLS: '!@#$%^&*()-_+=[]{}|;:,.<>?/~',
+        };
+
+        window.generatePassword = () => {
+            const length = parseInt(document.getElementById('gen-length')?.value || '16', 10);
+            const includeUpper = document.getElementById('gen-upper')?.checked;
+            const includeNumbers = document.getElementById('gen-numbers')?.checked;
+            const includeSymbols = document.getElementById('gen-symbols')?.checked;
+
+            let charSet = CHARS.LOWER;
+            if (includeUpper) charSet += CHARS.UPPER;
+            if (includeNumbers) charSet += CHARS.NUMBERS;
+            if (includeSymbols) charSet += CHARS.SYMBOLS;
+
+            let password = '';
+            if (includeUpper) password += CHARS.UPPER[crypto.getRandomValues(new Uint8Array(1))[0] % CHARS.UPPER.length];
+            if (includeNumbers) password += CHARS.NUMBERS[crypto.getRandomValues(new Uint8Array(1))[0] % CHARS.NUMBERS.length];
+            if (includeSymbols) password += CHARS.SYMBOLS[crypto.getRandomValues(new Uint8Array(1))[0] % CHARS.SYMBOLS.length];
+
+            for (let i = password.length; i < length; i++) {
+                password += charSet[crypto.getRandomValues(new Uint8Array(1))[0] % charSet.length];
+            }
+
+            password = password.split('').sort(() => 0.5 - Math.random()).join('');
+            window.state.generatedPassword = password;
+            const outputEl = document.getElementById('generated-password');
+            if(outputEl) outputEl.value = password;
+        };
+
+        window.copyToClipboard = async (text, successMessage) => {
+            if (!text) return;
+            const tempTextarea = document.createElement('textarea');
+            tempTextarea.value = text;
+            document.body.appendChild(tempTextarea);
+            tempTextarea.select();
+            try {
+                document.execCommand('copy');
+                showMessage(successMessage || "Copied to clipboard. Will clear in 15s.", false);
+                clearTimeout(window.state.clipboardClearTimeout);
+                window.state.clipboardClearTimeout = setTimeout(() => {
+                    const clearTextarea = document.createElement('textarea');
+                    clearTextarea.value = '';
+                    document.body.appendChild(clearTextarea);
+                    clearTextarea.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(clearTextarea);
+                }, 15000);
+            } catch (err) {
+                showMessage('Could not copy text.', true);
+            }
+            document.body.removeChild(tempTextarea);
+        };
+        
+        window.initializeAuth = () => {
+            onAuthStateChanged(window.auth, user => {
+                if (user) {
+                    window.state.userId = user.uid;
+                    document.getElementById('auth-status').textContent = `User ID: ${user.uid.substring(0, 8)}...`;
+                    if (!window.state.masterKey) renderAuthPrompt();
+                } else if (initialAuthToken) {
+                    signInWithCustomToken(window.auth, initialAuthToken).catch(() => signInAnonymously(window.auth));
+                } else {
+                    signInAnonymously(window.auth);
+                }
+            });
+        };
+
+        window.handleMasterPasswordEntry = async () => {
+            const password = document.getElementById('master-password').value;
+            if (!password) return showMessage("Master password is required.", true);
+
+            const button = document.getElementById('auth-button');
+            button.disabled = true;
+            button.innerHTML = '<i data-lucide="loader-2" class="animate-spin mr-2"></i> Deriving Key...';
+            lucide.createIcons();
+
+            try {
+                const userDocRef = doc(window.db, 'artifacts', appId, 'users', window.state.userId, 'metadata', 'salt');
+                let saltBase64;
+                await runTransaction(window.db, async (transaction) => {
+                    const userDoc = await transaction.get(userDocRef);
+                    if (userDoc.exists()) {
+                        saltBase64 = userDoc.data().salt;
+                    } else {
+                        const newSalt = crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
+                        saltBase64 = btoa(String.fromCharCode(...newSalt));
+                        transaction.set(userDocRef, { salt: saltBase64 });
+                    }
+                });
+                const salt = Uint8Array.from(atob(saltBase64), c => c.charCodeAt(0));
+                window.state.masterKey = await deriveKey(password, salt);
+                renderApp();
+                setupVaultListener();
+            } catch (e) {
+                showMessage("Failed to derive key. Incorrect password or connection issue.", true);
+                button.disabled = false;
+                button.textContent = 'Unlock Vault';
+            }
+        };
+
+        window.setupVaultListener = () => {
+            const vaultCollectionRef = collection(window.db, 'artifacts', appId, 'users', window.state.userId, 'vault_entries');
+            onSnapshot(query(vaultCollectionRef), async (snapshot) => {
+                const decryptionPromises = snapshot.docs.map(async (doc) => {
+                    const data = doc.data();
+                    try {
+                        const decryptedJson = await decrypt(data.encryptedBlob, data.iv, window.state.masterKey);
+                        const decryptedData = JSON.parse(decryptedJson);
+                        return { id: doc.id, title: data.title, ...decryptedData, updatedAt: data.updatedAt };
+                    } catch (e) {
+                        return { id: doc.id, title: data.title || 'Decryption Error', error: true };
+                    }
+                });
+                const items = (await Promise.all(decryptionPromises)).filter(item => !item.error);
+                window.state.vaultItems = items.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+                renderVaultList();
+            });
+        };
+
+        window.saveVaultItem = async (e) => {
+            e.preventDefault();
+            const form = e.target;
+            const id = form.getAttribute('data-item-id');
+            const isEditing = !!id;
+            const title = form.title.value.trim();
+            if (!title || !form.password.value) return showMessage("Title and Password are required.", true);
+
+            const button = form.querySelector('button[type="submit"]');
+            button.disabled = true;
+            
+            try {
+                const plaintextData = JSON.stringify({
+                    username: form.username.value,
+                    password: form.password.value,
+                    url: form.url.value,
+                    notes: form.notes.value,
+                });
+                const { ciphertext, iv } = await encrypt(plaintextData, window.state.masterKey);
+                const itemData = { title, encryptedBlob: ciphertext, iv, updatedAt: new Date().toISOString() };
+                const docRef = isEditing ? doc(window.db, 'artifacts', appId, 'users', window.state.userId, 'vault_entries', id) : doc(collection(window.db, 'artifacts', appId, 'users', window.state.userId, 'vault_entries'));
+                await setDoc(docRef, itemData);
+                showMessage(`Vault item ${isEditing ? 'updated' : 'saved'}.`);
+                window.state.editItem = null;
+                renderApp();
+            } catch (error) {
+                showMessage("Failed to save item.", true);
+            } finally {
+                button.disabled = false;
+            }
+        };
+
+        window.deleteVaultItem = (id) => {
+            showModal("Confirm Deletion", "Are you sure you want to permanently delete this item?", true, async () => {
+                const docRef = doc(window.db, 'artifacts', appId, 'users', window.state.userId, 'vault_entries', id);
+                await deleteDoc(docRef);
+                showMessage("Item deleted.");
+                if (window.state.editItem?.id === id) window.state.editItem = null;
+                renderApp();
+            });
+        };
+
+        window.editItem = (id) => {
+            window.state.editItem = window.state.vaultItems.find(item => item.id === id);
+            renderVaultList();
+            renderVaultForm();
+            document.getElementById('vault-form-card')?.scrollIntoView({ behavior: 'smooth' });
+        };
+
+        window.renderAuthPrompt = () => {
+            document.getElementById('main-content').innerHTML = `
+                <div class="max-w-md mx-auto p-8 text-center">
+                    <i data-lucide="key-round" class="w-10 h-10 mx-auto text-indigo-500 mb-4"></i>
+                    <h2 class="text-2xl font-semibold mb-2">Unlock Your Vault</h2>
+                    <p class="text-sm text-gray-600">Enter your master password. If this is your first time, a new vault will be created for you with this password.</p>
+                    <p class="text-xs text-red-500 my-4 font-semibold">WARNING: This password is never stored. If you forget it, your data cannot be recovered.</p>
+                    <input type="password" id="master-password" class="input-text text-center text-lg" placeholder="••••••••••" required onkeydown="if(event.key==='Enter') window.handleMasterPasswordEntry()">
+                    <button id="auth-button" onclick="window.handleMasterPasswordEntry()" class="mt-4 btn-primary w-full bg-indigo-600 text-white font-semibold py-3 rounded-xl flex items-center justify-center">Unlock Vault</button>
+                    <div id="message-container" class="mt-4"></div>
+                </div>`;
+            lucide.createIcons();
+        };
+
+        window.renderApp = () => {
+            if (!window.state.masterKey) return renderAuthPrompt();
+            document.getElementById('main-content').innerHTML = `
+                <div class="flex border-b border-gray-200 mb-6">
+                    <button onclick="window.state.currentTab = 'vault'; renderApp()" class="px-4 py-2 flex items-center space-x-2 ${window.state.currentTab === 'vault' ? 'tab-active' : 'text-gray-500 hover:text-gray-700'}"><i data-lucide="lock"></i><span>Vault</span></button>
+                    <button onclick="window.state.currentTab = 'generator'; renderApp()" class="px-4 py-2 flex items-center space-x-2 ${window.state.currentTab === 'generator' ? 'tab-active' : 'text-gray-500 hover:text-gray-700'}"><i data-lucide="key"></i><span>Generator</span></button>
+                </div>
+                <div id="message-container"></div>
+                <div id="tab-content"></div>`;
+            if (window.state.currentTab === 'vault') {
+                document.getElementById('tab-content').innerHTML = renderVaultTab();
+                renderVaultList();
+                renderVaultForm();
+            } else {
+                document.getElementById('tab-content').innerHTML = renderGeneratorTab();
+                window.generatePassword();
+            }
+            lucide.createIcons();
+        };
+
+        window.renderGeneratorTab = () => `
+            <div class="max-w-xl mx-auto p-6 bg-gray-50 rounded-xl shadow-inner border">
+                <h3 class="text-xl font-semibold text-gray-800 mb-4">Password Generator</h3>
+                <div class="flex space-x-2 mb-4">
+                    <input type="text" id="generated-password" class="input-text text-lg font-mono flex-grow" readonly>
+                    <button onclick="window.copyToClipboard(window.state.generatedPassword, 'Generated password copied.')" class="btn-primary flex-shrink-0 bg-indigo-500 text-white p-3 rounded-lg"><i data-lucide="copy"></i></button>
+                </div>
+                <div class="space-y-4">
+                    <div>
+                        <label for="gen-length" class="text-sm font-medium text-gray-700 flex justify-between">Length: <span id="length-value" class="font-bold">16</span></label>
+                        <input type="range" id="gen-length" min="8" max="64" value="16" oninput="document.getElementById('length-value').textContent = this.value; window.generatePassword()" class="w-full h-2 bg-indigo-100 rounded-lg appearance-none cursor-pointer mt-1">
+                    </div>
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                        <label class="flex items-center"><input id="gen-upper" type="checkbox" checked onchange="window.generatePassword()" class="h-4 w-4 text-indigo-600 border-gray-300 rounded"><span class="ml-2 text-sm">Uppercase</span></label>
+                        <label class="flex items-center"><input id="gen-numbers" type="checkbox" checked onchange="window.generatePassword()" class="h-4 w-4 text-indigo-600 border-gray-300 rounded"><span class="ml-2 text-sm">Numbers</span></label>
+                        <label class="flex items-center"><input id="gen-symbols" type="checkbox" checked onchange="window.generatePassword()" class="h-4 w-4 text-indigo-600 border-gray-300 rounded"><span class="ml-2 text-sm">Symbols</span></label>
+                    </div>
+                    <p class="text-xs text-gray-500">Look-alike characters (0/O, 1/l) are automatically excluded.</p>
+                </div>
+            </div>`;
+
+        window.renderVaultTab = () => `
+            <div class="flex flex-col lg:flex-row gap-6">
+                <div class="lg:w-1/2 xl:w-2/5 space-y-4">
+                    <div class="relative">
+                        <i data-lucide="search" class="w-5 h-5 absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400"></i>
+                        <input type="text" id="vault-search" value="${window.state.searchTerm}" oninput="window.state.searchTerm = this.value; renderVaultList()" placeholder="Search vault..." class="input-text pl-10">
+                    </div>
+                    <div class="bg-white rounded-xl shadow border border-gray-200 h-[60vh] overflow-hidden flex flex-col">
+                        <div class="p-4 bg-gray-50 border-b font-medium text-gray-700">Your Secrets</div>
+                        <div id="vault-list" class="vault-list-container flex-grow overflow-y-auto"></div>
+                    </div>
+                </div>
+                <div id="vault-form-card" class="lg:w-1/2 xl:w-3/5"></div>
+            </div>`;
+
+        window.renderVaultList = () => {
+            const listContainer = document.getElementById('vault-list');
+            if (!listContainer) return;
+            const filteredItems = window.state.vaultItems.filter(item => item.title.toLowerCase().includes(window.state.searchTerm.toLowerCase()));
+            
+            if (filteredItems.length === 0) {
+                listContainer.innerHTML = `<div class="p-8 text-center text-gray-500"><i data-lucide="box" class="w-8 h-8 mx-auto mb-3"></i><p>No items found.</p></div>`;
+            } else {
+                listContainer.innerHTML = filteredItems.map(item => `
+                    <div onclick="window.editItem('${item.id}')" class="p-4 border-b cursor-pointer hover:bg-indigo-50 flex justify-between items-center ${window.state.editItem?.id === item.id ? 'bg-indigo-100 border-l-4 border-indigo-500' : ''}">
+                        <div class="min-w-0"><h4 class="font-semibold text-gray-800 truncate">${item.title}</h4><p class="text-xs text-gray-500 truncate">${item.username || ''}</p></div>
+                        <i data-lucide="chevron-right" class="w-5 h-5 text-gray-400 flex-shrink-0"></i>
+                    </div>`).join('');
+            }
+            lucide.createIcons();
+        };
+
+        window.renderVaultForm = () => {
+            const formContainer = document.getElementById('vault-form-card');
+            if (!formContainer) return;
+            const item = window.state.editItem;
+            const isEditing = !!item?.id;
+
+            if (!item) {
+                formContainer.innerHTML = `<div class="p-6 bg-gray-50 rounded-xl shadow-inner border h-full flex flex-col items-center justify-center text-center">
+                    <i data-lucide="file-plus-2" class="w-10 h-10 text-gray-400 mb-4"></i>
+                    <p class="text-gray-600 font-medium">Select an item to view or edit.</p>
+                    <button onclick="window.state.editItem = {}; renderVaultForm()" class="mt-4 btn-primary bg-indigo-600 text-white font-semibold py-2 px-4 rounded-lg flex items-center"><i data-lucide="plus" class="mr-2"></i>Add New Item</button>
+                </div>`;
+                lucide.createIcons();
+                return;
+            }
+
+            formContainer.innerHTML = `
+                <form onsubmit="window.saveVaultItem(event)" data-item-id="${item.id || ''}" class="bg-white p-6 rounded-xl shadow-lg border border-indigo-200 space-y-4">
+                    <div class="flex justify-between items-center">
+                        <h3 class="text-xl font-bold text-indigo-600">${isEditing ? 'Edit Item' : 'Add New Item'}</h3>
+                        ${isEditing ? `<button type="button" onclick="window.deleteVaultItem('${item.id}')" class="p-2 text-red-500 hover:bg-red-100 rounded-full"><i data-lucide="trash-2"></i></button>` : ''}
+                    </div>
+                    <div><label for="title" class="text-sm font-medium">Title <span class="text-red-500">*</span></label><input type="text" id="title" name="title" value="${item.title || ''}" class="input-text mt-1" required></div>
+                    <div><label for="username" class="text-sm font-medium">Username/Email</label><input type="text" id="username" name="username" value="${item.username || ''}" class="input-text mt-1"></div>
+                    <div>
+                        <label for="password" class="text-sm font-medium">Password <span class="text-red-500">*</span></label>
+                        <div class="flex space-x-2 mt-1">
+                            <input type="password" id="password" name="password" value="${item.password || ''}" class="input-text font-mono flex-grow" required>
+                            <button type="button" onclick="const input = document.getElementById('password'); input.type = input.type === 'password' ? 'text' : 'password';" class="p-2 text-gray-600 hover:bg-gray-100 rounded-lg"><i data-lucide="eye"></i></button>
+                            <button type="button" onclick="document.getElementById('password').value = window.state.generatedPassword;" class="p-2 text-indigo-600 hover:bg-indigo-100 rounded-lg"><i data-lucide="zap"></i></button>
+                            <button type="button" onclick="window.copyToClipboard(document.getElementById('password').value, 'Password copied.')" class="p-2 text-green-600 hover:bg-green-100 rounded-lg"><i data-lucide="copy"></i></button>
+                        </div>
+                    </div>
+                    <div><label for="url" class="text-sm font-medium">URL</label><input type="text" id="url" name="url" value="${item.url || ''}" class="input-text mt-1"></div>
+                    <div><label for="notes" class="text-sm font-medium">Notes</label><textarea id="notes" name="notes" rows="3" class="input-text mt-1 resize-y">${item.notes || ''}</textarea></div>
+                    <div class="flex justify-end space-x-3 pt-4">
+                        <button type="button" onclick="window.state.editItem = null; renderVaultForm()" class="px-4 py-2 bg-gray-200 text-gray-700 font-medium rounded-lg hover:bg-gray-300">Cancel</button>
+                        <button type="submit" class="btn-primary bg-indigo-600 text-white font-semibold py-2 px-5 rounded-lg flex items-center"><i data-lucide="save" class="mr-2"></i>${isEditing ? 'Update' : 'Save'}</button>
+                    </div>
+                </form>`;
+            lucide.createIcons();
+        };
+        
+        window.onload = () => {
+            if (window.auth) initializeAuth();
+        };
+    </script>
+</body>
+</html>
